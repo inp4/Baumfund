@@ -51,6 +51,23 @@ RATE_LIMIT_BACKOFF_SECONDS = int(os.environ.get("RATE_LIMIT_BACKOFF_SECONDS", "9
 RUNNING = True
 
 
+def default_state() -> dict:
+    return {
+        "chat_ids": [],
+        "telegram_offset": 0,
+        "last_alert_total": None,
+        "last_seen_total": None,
+        "last_prices": {},
+        "previous_prices": {},
+        "last_prices_at": 0,
+        "previous_prices_at": 0,
+        "rate_limited_until": 0,
+        "custom_balance_alert_usd": None,
+        "custom_balance_alert_percent": None,
+        "started_at": now_iso(),
+    }
+
+
 def stop(_signum, _frame) -> None:
     global RUNNING
     RUNNING = False
@@ -66,18 +83,12 @@ def now_iso() -> str:
 
 def load_state() -> dict:
     if not STATE_FILE.exists():
-        return {
-            "chat_ids": [],
-            "telegram_offset": 0,
-            "last_alert_total": None,
-            "last_seen_total": None,
-            "last_prices": {},
-            "last_prices_at": 0,
-            "rate_limited_until": 0,
-            "started_at": now_iso(),
-        }
+        return default_state()
 
-    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    merged = default_state()
+    merged.update(state)
+    return merged
 
 
 def save_state(state: dict) -> None:
@@ -153,6 +164,30 @@ def format_percent(value: float) -> str:
     return f"{sign}{value:.2f}%"
 
 
+def format_number(value: float) -> str:
+    return f"{value:,.8g}"
+
+
+def format_age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def get_thresholds(state: dict) -> tuple[float, float]:
+    usd = state.get("custom_balance_alert_usd")
+    pct = state.get("custom_balance_alert_percent")
+    return (
+        float(usd) if usd is not None else BALANCE_ALERT_USD,
+        float(pct) if pct is not None else BALANCE_ALERT_PERCENT,
+    )
+
+
 def fetch_prices(state: dict | None = None, *, force: bool = False) -> dict:
     state = state if state is not None else {}
     now = time.time()
@@ -185,6 +220,9 @@ def fetch_prices(state: dict | None = None, *, force: bool = False) -> dict:
           price = data.get(cg_id, {}).get("usd")
           if isinstance(price, (int, float)):
               prices[cg_id] = float(price)
+    if state.get("last_prices"):
+        state["previous_prices"] = state.get("last_prices", {})
+        state["previous_prices_at"] = state.get("last_prices_at", 0)
     state["last_prices"] = prices
     state["last_prices_at"] = now
     state["rate_limited_until"] = 0
@@ -219,28 +257,75 @@ def calculate_balance(prices: dict) -> tuple[float, list[dict]]:
 
 
 def balance_message(total: float, rows: list[dict], title: str = "BAUM balance") -> str:
+    rows_sorted = sorted(rows, key=lambda row: row["value"], reverse=True)
     lines = [f"<b>{title}</b>", f"Total: <b>{format_usd(total)}</b>", ""]
-    for row in rows:
+    for row in rows_sorted:
+        alloc = (row["value"] / total) * 100 if total else 0
         lines.append(
             f"{row['ticker']}: {format_usd(row['value'])} "
-            f"({row['qty']:.8g} × {format_usd(row['price'])})"
+            f"({alloc:.2f}%, {format_number(row['qty'])} × {format_usd(row['price'])})"
         )
     return "\n".join(lines)
 
 
-def should_alert(last_total: float | None, current_total: float) -> tuple[bool, float, float]:
+def should_alert(last_total: float | None, current_total: float, usd_threshold: float, pct_threshold: float) -> tuple[bool, float, float]:
     if last_total is None:
         return False, 0.0, 0.0
 
     diff = current_total - last_total
     pct = (diff / last_total) * 100 if last_total else 0.0
-    return abs(diff) >= BALANCE_ALERT_USD or abs(pct) >= BALANCE_ALERT_PERCENT, diff, pct
+    return abs(diff) >= usd_threshold or abs(pct) >= pct_threshold, diff, pct
+
+
+def price_changes_message(state: dict, rows: list[dict]) -> str:
+    prev_prices = state.get("previous_prices") or {}
+    if not prev_prices:
+        return "Drivers: no previous price snapshot yet."
+
+    changes = []
+    for row in rows:
+        asset = next((item for item in ASSETS if item["ticker"] == row["ticker"]), None)
+        if not asset or not asset["cg_id"]:
+            continue
+        prev_price = prev_prices.get(asset["cg_id"])
+        if prev_price is None:
+            continue
+        value_delta = asset["qty"] * (row["price"] - prev_price)
+        if abs(value_delta) < 0.01:
+            continue
+        changes.append((abs(value_delta), row["ticker"], value_delta))
+
+    if not changes:
+        return "Drivers: no meaningful change since last check."
+
+    top = sorted(changes, reverse=True)[:3]
+    return "Drivers: " + ", ".join(f"{ticker} {format_signed_usd(delta)}" for _, ticker, delta in top)
+
+
+def prices_message(state: dict, prices: dict) -> str:
+    prev_prices = state.get("previous_prices") or {}
+    rows = []
+    for asset in ASSETS:
+        if not asset["cg_id"]:
+            continue
+        price = prices.get(asset["cg_id"])
+        if price is None:
+            continue
+        prev_price = prev_prices.get(asset["cg_id"])
+        if prev_price:
+            pct = ((price - prev_price) / prev_price) * 100
+            delta_text = format_percent(pct)
+        else:
+            delta_text = "new"
+        rows.append(f"{asset['ticker']}: {format_usd(price)} ({delta_text})")
+    return "<b>BAUM prices</b>\n\n" + "\n".join(rows)
 
 
 def check_balance(state: dict, *, force_summary: bool = False) -> None:
     prices = fetch_prices(state)
     total, rows = calculate_balance(prices)
     last_alert_total = state.get("last_alert_total")
+    usd_threshold, pct_threshold = get_thresholds(state)
 
     if last_alert_total is None:
         state["last_alert_total"] = total
@@ -250,7 +335,7 @@ def check_balance(state: dict, *, force_summary: bool = False) -> None:
             broadcast(state, balance_message(total, rows, "BAUM monitor started"))
         return
 
-    alert, diff, pct = should_alert(last_alert_total, total)
+    alert, diff, pct = should_alert(last_alert_total, total, usd_threshold, pct_threshold)
     state["last_seen_total"] = total
 
     if alert:
@@ -261,6 +346,7 @@ def check_balance(state: dict, *, force_summary: bool = False) -> None:
                 f"Current: <b>{format_usd(total)}</b>",
                 f"Change: <b>{format_signed_usd(diff)}</b> ({format_percent(pct)})",
                 f"Previous alert baseline: {format_usd(last_alert_total)}",
+                price_changes_message(state, rows),
             ]
         )
         broadcast(state, text)
@@ -282,6 +368,7 @@ def handle_command(state: dict, message: dict) -> None:
     command = text.split()[0].split("@")[0].lower()
 
     if command in {"/start", "/help"}:
+        usd_threshold, pct_threshold = get_thresholds(state)
         send_message(
             chat_id,
             "\n".join(
@@ -289,34 +376,52 @@ def handle_command(state: dict, message: dict) -> None:
                     "<b>BAUM balance bot</b>",
                     "",
                     "/balance - current portfolio value",
+                    "/prices - current tracked prices",
                     "/status - monitor settings",
+                    "/setusd 100 - set USD alert threshold",
+                    "/setpct 0.50 - set percent alert threshold",
+                    "/resetthresholds - restore default thresholds",
                     "/help - commands",
                     "",
-                    f"Alert threshold: {format_usd(BALANCE_ALERT_USD)} or {BALANCE_ALERT_PERCENT:.2f}%",
+                    f"Alert threshold: {format_usd(usd_threshold)} or {pct_threshold:.2f}%",
                 ]
             ),
         )
         return
 
     if command == "/status":
+        usd_threshold, pct_threshold = get_thresholds(state)
         rate_limited_until = float(state.get("rate_limited_until") or 0)
         rate_limit_text = "no"
         if rate_limited_until > time.time():
             rate_limit_text = f"yes, retry after {int(rate_limited_until - time.time())}s"
+        last_prices_at = float(state.get("last_prices_at") or 0)
+        cache_age = format_age(time.time() - last_prices_at) if last_prices_at else "none"
         send_message(
             chat_id,
             "\n".join(
                 [
                     "<b>Monitor status</b>",
                     f"Check interval: {CHECK_INTERVAL_SECONDS}s",
-                    f"USD threshold: {format_usd(BALANCE_ALERT_USD)}",
-                    f"Percent threshold: {BALANCE_ALERT_PERCENT:.2f}%",
+                    f"USD threshold: {format_usd(usd_threshold)}",
+                    f"Percent threshold: {pct_threshold:.2f}%",
                     f"Price cache: {PRICE_CACHE_SECONDS}s",
+                    f"Last price snapshot age: {cache_age}",
                     f"CoinGecko rate limited: {rate_limit_text}",
+                    f"Subscribed chats: {len(state.get('chat_ids', []))}",
                     f"Last seen total: {format_usd(state['last_seen_total']) if state.get('last_seen_total') else 'not checked yet'}",
                 ]
             ),
         )
+        return
+
+    if command == "/prices":
+        try:
+            prices = fetch_prices(state)
+            save_state(state)
+            send_message(chat_id, prices_message(state, prices))
+        except Exception as error:
+            send_message(chat_id, f"Could not fetch prices: {error}")
         return
 
     if command == "/balance":
@@ -328,6 +433,37 @@ def handle_command(state: dict, message: dict) -> None:
             send_message(chat_id, balance_message(total, rows))
         except Exception as error:
             send_message(chat_id, f"Could not fetch balance: {error}")
+        return
+
+    if command == "/setusd":
+        try:
+            value = float(text.split()[1])
+            if value <= 0:
+                raise ValueError
+            state["custom_balance_alert_usd"] = value
+            save_state(state)
+            send_message(chat_id, f"USD alert threshold set to {format_usd(value)}")
+        except Exception:
+            send_message(chat_id, "Usage: /setusd 100")
+        return
+
+    if command == "/setpct":
+        try:
+            value = float(text.split()[1])
+            if value <= 0:
+                raise ValueError
+            state["custom_balance_alert_percent"] = value
+            save_state(state)
+            send_message(chat_id, f"Percent alert threshold set to {value:.2f}%")
+        except Exception:
+            send_message(chat_id, "Usage: /setpct 0.50")
+        return
+
+    if command == "/resetthresholds":
+        state["custom_balance_alert_usd"] = None
+        state["custom_balance_alert_percent"] = None
+        save_state(state)
+        send_message(chat_id, "Alert thresholds restored to defaults.")
         return
 
     send_message(chat_id, "Unknown command. Use /help.")

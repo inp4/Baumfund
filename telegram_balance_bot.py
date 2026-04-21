@@ -62,8 +62,6 @@ def default_state() -> dict:
         "last_prices_at": 0,
         "previous_prices_at": 0,
         "rate_limited_until": 0,
-        "custom_balance_alert_usd": None,
-        "custom_balance_alert_percent": None,
         "started_at": now_iso(),
     }
 
@@ -131,15 +129,36 @@ def telegram_api(method: str, payload: dict | None = None) -> dict:
 
 
 def send_message(chat_id: int, text: str) -> None:
-    telegram_api(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-    )
+    send_message_with_markup(chat_id, text)
+
+
+def send_message_with_markup(chat_id: int, text: str, reply_markup: dict | None = None) -> None:
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    telegram_api("sendMessage", payload)
+
+
+def edit_message(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None) -> None:
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    telegram_api("editMessageText", payload)
+
+
+def answer_callback_query(callback_query_id: str) -> None:
+    telegram_api("answerCallbackQuery", {"callback_query_id": callback_query_id})
 
 
 def broadcast(state: dict, text: str) -> None:
@@ -179,21 +198,30 @@ def format_age(seconds: float) -> str:
     return f"{seconds // 86400}d"
 
 
-def get_thresholds(state: dict) -> tuple[float, float]:
-    usd = state.get("custom_balance_alert_usd")
-    pct = state.get("custom_balance_alert_percent")
-    return (
-        float(usd) if usd is not None else BALANCE_ALERT_USD,
-        float(pct) if pct is not None else BALANCE_ALERT_PERCENT,
-    )
-
-
 def wrap_code_block(lines: list[str]) -> str:
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
 def divider() -> str:
     return "────────────"
+
+
+def menu_markup() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "◈ Balance", "callback_data": "menu:balance"},
+                {"text": "⌁ Prices", "callback_data": "menu:prices"},
+            ],
+            [
+                {"text": "◎ Status", "callback_data": "menu:status"},
+                {"text": "↻ Refresh", "callback_data": "menu:refresh"},
+            ],
+            [
+                {"text": "BAUM", "callback_data": "menu:home"},
+            ],
+        ]
+    }
 
 
 def fetch_prices(state: dict | None = None, *, force: bool = False) -> dict:
@@ -335,9 +363,28 @@ def prices_message(state: dict, prices: dict) -> str:
         rows.append(f"{asset['ticker']:<5} {format_usd(price):>12}  {delta_text:>9}")
     return "\n".join(
         [
-            "<b>BAUM prices</b>",
+            "<b>BAUM / prices</b>",
             divider(),
             wrap_code_block(rows),
+        ]
+    )
+
+
+def home_message() -> str:
+    return "\n".join(
+        [
+            "<b>BAUM / live desk</b>",
+            divider(),
+            "<b>Tap a panel below</b>",
+            wrap_code_block(
+                [
+                    "◈ Balance   current portfolio value",
+                    "⌁ Prices    tracked market prices",
+                    "◎ Status    monitor + cache state",
+                    "↻ Refresh   force fresh balance view",
+                ]
+            ),
+            f"<b>Alert threshold</b>  {format_usd(BALANCE_ALERT_USD)} or {BALANCE_ALERT_PERCENT:.2f}%",
         ]
     )
 
@@ -346,17 +393,16 @@ def check_balance(state: dict, *, force_summary: bool = False) -> None:
     prices = fetch_prices(state)
     total, rows = calculate_balance(prices)
     last_alert_total = state.get("last_alert_total")
-    usd_threshold, pct_threshold = get_thresholds(state)
 
     if last_alert_total is None:
         state["last_alert_total"] = total
         state["last_seen_total"] = total
         save_state(state)
         if force_summary or SEND_STARTUP_SUMMARY:
-            broadcast(state, balance_message(total, rows, "BAUM monitor started"))
+            broadcast(state, balance_message(total, rows, "BAUM / monitor started"))
         return
 
-    alert, diff, pct = should_alert(last_alert_total, total, usd_threshold, pct_threshold)
+    alert, diff, pct = should_alert(last_alert_total, total, BALANCE_ALERT_USD, BALANCE_ALERT_PERCENT)
     state["last_seen_total"] = total
 
     if alert:
@@ -394,49 +440,31 @@ def handle_command(state: dict, message: dict) -> None:
     command = text.split()[0].split("@")[0].lower()
 
     if command in {"/start", "/help"}:
-        usd_threshold, pct_threshold = get_thresholds(state)
-        send_message(
+        send_message_with_markup(
             chat_id,
-            "\n".join(
-                [
-                    "<b>BAUM balance bot</b>",
-                    divider(),
-                    "<b>Commands</b>",
-                    wrap_code_block(
-                        [
-                            "/balance          portfolio value",
-                            "/prices           tracked prices",
-                            "/status           monitor state",
-                            "/setusd 100       usd threshold",
-                            "/setpct 0.50      percent threshold",
-                            "/resetthresholds  restore defaults",
-                        ]
-                    ),
-                    f"<b>Alert threshold</b>  {format_usd(usd_threshold)} or {pct_threshold:.2f}%",
-                ]
-            ),
+            home_message(),
+            menu_markup(),
         )
         return
 
     if command == "/status":
-        usd_threshold, pct_threshold = get_thresholds(state)
         rate_limited_until = float(state.get("rate_limited_until") or 0)
         rate_limit_text = "no"
         if rate_limited_until > time.time():
             rate_limit_text = f"yes, retry after {int(rate_limited_until - time.time())}s"
         last_prices_at = float(state.get("last_prices_at") or 0)
         cache_age = format_age(time.time() - last_prices_at) if last_prices_at else "none"
-        send_message(
+        send_message_with_markup(
             chat_id,
             "\n".join(
                 [
-                    "<b>Monitor status</b>",
+                    "<b>BAUM / status</b>",
                     divider(),
                     wrap_code_block(
                         [
                             f"Interval    {CHECK_INTERVAL_SECONDS}s",
-                            f"USD thr     {format_usd(usd_threshold)}",
-                            f"PCT thr     {pct_threshold:.2f}%",
+                            f"USD thr     {format_usd(BALANCE_ALERT_USD)}",
+                            f"PCT thr     {BALANCE_ALERT_PERCENT:.2f}%",
                             f"Cache       {PRICE_CACHE_SECONDS}s",
                             f"Snapshot    {cache_age}",
                             f"Rate limit  {rate_limit_text}",
@@ -446,6 +474,7 @@ def handle_command(state: dict, message: dict) -> None:
                     ),
                 ]
             ),
+            menu_markup(),
         )
         return
 
@@ -453,7 +482,7 @@ def handle_command(state: dict, message: dict) -> None:
         try:
             prices = fetch_prices(state)
             save_state(state)
-            send_message(chat_id, prices_message(state, prices))
+            send_message_with_markup(chat_id, prices_message(state, prices), menu_markup())
         except Exception as error:
             send_message(chat_id, f"Could not fetch prices: {error}")
         return
@@ -464,58 +493,96 @@ def handle_command(state: dict, message: dict) -> None:
             total, rows = calculate_balance(prices)
             state["last_seen_total"] = total
             save_state(state)
-            send_message(chat_id, balance_message(total, rows, "BAUM portfolio"))
+            send_message_with_markup(chat_id, balance_message(total, rows, "BAUM / portfolio"), menu_markup())
         except Exception as error:
             send_message(chat_id, f"Could not fetch balance: {error}")
         return
 
-    if command == "/setusd":
-        try:
-            value = float(text.split()[1])
-            if value <= 0:
-                raise ValueError
-            state["custom_balance_alert_usd"] = value
-            save_state(state)
-            send_message(chat_id, f"<b>USD threshold updated</b>\n{divider()}\n<code>{format_usd(value)}</code>")
-        except Exception:
-            send_message(chat_id, "Usage: /setusd 100")
-        return
-
-    if command == "/setpct":
-        try:
-            value = float(text.split()[1])
-            if value <= 0:
-                raise ValueError
-            state["custom_balance_alert_percent"] = value
-            save_state(state)
-            send_message(chat_id, f"<b>Percent threshold updated</b>\n{divider()}\n<code>{value:.2f}%</code>")
-        except Exception:
-            send_message(chat_id, "Usage: /setpct 0.50")
-        return
-
-    if command == "/resetthresholds":
-        state["custom_balance_alert_usd"] = None
-        state["custom_balance_alert_percent"] = None
-        save_state(state)
-        send_message(chat_id, "<b>Thresholds restored</b>\n" + divider())
-        return
-
     send_message(chat_id, "Unknown command. Use /help.")
+
+
+def handle_callback(state: dict, callback_query: dict) -> None:
+    callback_id = callback_query.get("id")
+    message = callback_query.get("message") or {}
+    data = callback_query.get("data") or ""
+    chat_id = message.get("chat", {}).get("id")
+    message_id = message.get("message_id")
+
+    if callback_id:
+        answer_callback_query(callback_id)
+    if not chat_id or not message_id:
+        return
+
+    try:
+        if data == "menu:home":
+            edit_message(chat_id, message_id, home_message(), menu_markup())
+            return
+
+        if data in {"menu:balance", "menu:refresh"}:
+            prices = fetch_prices(state, force=(data == "menu:refresh"))
+            total, rows = calculate_balance(prices)
+            state["last_seen_total"] = total
+            save_state(state)
+            edit_message(chat_id, message_id, balance_message(total, rows, "BAUM / portfolio"), menu_markup())
+            return
+
+        if data == "menu:prices":
+            prices = fetch_prices(state)
+            save_state(state)
+            edit_message(chat_id, message_id, prices_message(state, prices), menu_markup())
+            return
+
+        if data == "menu:status":
+            rate_limited_until = float(state.get("rate_limited_until") or 0)
+            rate_limit_text = "no"
+            if rate_limited_until > time.time():
+                rate_limit_text = f"yes, retry after {int(rate_limited_until - time.time())}s"
+            last_prices_at = float(state.get("last_prices_at") or 0)
+            cache_age = format_age(time.time() - last_prices_at) if last_prices_at else "none"
+            edit_message(
+                chat_id,
+                message_id,
+                "\n".join(
+                    [
+                        "<b>BAUM / status</b>",
+                        divider(),
+                        wrap_code_block(
+                            [
+                                f"Interval    {CHECK_INTERVAL_SECONDS}s",
+                                f"USD thr     {format_usd(BALANCE_ALERT_USD)}",
+                                f"PCT thr     {BALANCE_ALERT_PERCENT:.2f}%",
+                                f"Cache       {PRICE_CACHE_SECONDS}s",
+                                f"Snapshot    {cache_age}",
+                                f"Rate limit  {rate_limit_text}",
+                                f"Chats       {len(state.get('chat_ids', []))}",
+                                f"Last total  {format_usd(state['last_seen_total']) if state.get('last_seen_total') else 'n/a'}",
+                            ]
+                        ),
+                    ]
+                ),
+                menu_markup(),
+            )
+            return
+    except Exception as error:
+        edit_message(chat_id, message_id, f"<b>BAUM / error</b>\n{divider()}\n<code>{error}</code>", menu_markup())
 
 
 def poll_telegram(state: dict) -> None:
     payload = {
         "timeout": 10,
         "offset": state.get("telegram_offset", 0),
-        "allowed_updates": ["message"],
+        "allowed_updates": ["message", "callback_query"],
     }
     data = telegram_api("getUpdates", payload)
 
     for update in data.get("result", []):
         state["telegram_offset"] = max(state.get("telegram_offset", 0), update["update_id"] + 1)
         message = update.get("message")
+        callback_query = update.get("callback_query")
         if message:
             handle_command(state, message)
+        if callback_query:
+            handle_callback(state, callback_query)
 
     save_state(state)
 

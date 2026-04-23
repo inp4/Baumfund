@@ -129,7 +129,7 @@ def telegram_api(method: str, payload: dict | None = None) -> dict:
 
 
 def send_message(chat_id: int, text: str) -> None:
-    send_message_with_markup(chat_id, text)
+    send_message_with_markup(chat_id, text, chat_menu_markup())
 
 
 def send_message_with_markup(chat_id: int, text: str, reply_markup: dict | None = None) -> None:
@@ -206,19 +206,27 @@ def divider() -> str:
     return "────────────"
 
 
+def chat_menu_markup() -> dict:
+    return {
+        "keyboard": [[{"text": "Menu"}]],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
 def menu_markup() -> dict:
     return {
         "inline_keyboard": [
             [
-                {"text": "◈ Balance", "callback_data": "menu:balance"},
-                {"text": "⌁ Prices", "callback_data": "menu:prices"},
+                {"text": "Balance", "callback_data": "menu:balance"},
+                {"text": "Prices", "callback_data": "menu:prices"},
             ],
             [
-                {"text": "◎ Status", "callback_data": "menu:status"},
-                {"text": "↻ Refresh", "callback_data": "menu:refresh"},
+                {"text": "Status", "callback_data": "menu:status"},
+                {"text": "Refresh", "callback_data": "menu:refresh"},
             ],
             [
-                {"text": "BAUM", "callback_data": "menu:home"},
+                {"text": "Go back", "callback_data": "menu:home"},
             ],
         ]
     }
@@ -378,10 +386,10 @@ def home_message() -> str:
             "<b>Tap a panel below</b>",
             wrap_code_block(
                 [
-                    "◈ Balance   current portfolio value",
-                    "⌁ Prices    tracked market prices",
-                    "◎ Status    monitor + cache state",
-                    "↻ Refresh   force fresh balance view",
+                    "Balance   current portfolio value",
+                    "Prices    tracked market prices",
+                    "Status    monitor + cache state",
+                    "Refresh   force fresh balance view",
                 ]
             ),
             f"<b>Alert threshold</b>  {format_usd(BALANCE_ALERT_USD)} or {BALANCE_ALERT_PERCENT:.2f}%",
@@ -439,7 +447,7 @@ def handle_command(state: dict, message: dict) -> None:
 
     command = text.split()[0].split("@")[0].lower()
 
-    if command in {"/start", "/help"}:
+    if command in {"/start", "/help"} or text.lower() == "menu":
         send_message_with_markup(
             chat_id,
             home_message(),
